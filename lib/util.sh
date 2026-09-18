@@ -9,16 +9,22 @@
 # GNU General Public License for more details.
 
 # $1: section
+# $2: config file
 parse_section() {
+    local section_name="$1"
+    local config_file="$2"
     local is_section=0
-    while read line; do
-        [[ $line =~ ^\ {0,}# ]] && continue
+    local line pc_key pc_value section
+
+    while IFS= read -r line; do
+        [[ $line =~ ^[[:space:]]*# ]] && continue
         [[ -z "$line" ]] && continue
-        if [ $is_section == 0 ]; then
+
+        if (( is_section == 0 )); then
             if [[ $line =~ ^\[.*?\] ]]; then
                 line=${line:1:$((${#line}-2))}
                 section=${line// /}
-                if [[ $section == $1 ]]; then
+                if [[ $section == "$section_name" ]]; then
                     is_section=1
                     continue
                 fi
@@ -31,15 +37,18 @@ parse_section() {
             pc_key=${pc_key// /}
             pc_value=${line##*=}
             pc_value=${pc_value## }
-            eval "$pc_key='$pc_value'"
+            # Use declare instead of eval for safety
+            declare -g "$pc_key=$pc_value"
         fi
-    done < "$2"
+    done < "$config_file"
 }
 
 get_repos() {
-    local section repos=() filter='^\ {0,}#'
-    while read line; do
-        [[ $line =~ "${filter}" ]] && continue
+    local repos=() filter='^[[:space:]]*#'
+    local line section
+
+    while IFS= read -r line; do
+        [[ $line =~ $filter ]] && continue
         [[ -z "$line" ]] && continue
         if [[ $line =~ ^\[.*?\] ]]; then
             line=${line:1:$((${#line}-2))}
@@ -50,15 +59,17 @@ get_repos() {
             esac
         fi
     done < "$1"
-    echo ${repos[@]}
+    printf '%s\n' "${repos[@]}"
 }
 
 check_user_repos_conf(){
-    local repositories=$(get_repos "$1") uri='file://'
-    for repo in ${repositories[@]}; do
+    local repos uri='file://'
+    mapfile -t repos < <(get_repos "$1")
+    local repo
+    for repo in "${repos[@]}"; do
         msg2 "parsing repo [%s] ..." "${repo}"
         parse_section "${repo}" "$1"
-        [[ ${pc_value} == $uri* ]] && die "Using local repositories is not supported!"
+        [[ ${pc_value} == "$uri"* ]] && die "Using local repositories is not supported!"
     done
 }
 
@@ -84,69 +95,76 @@ read_build_list(){
 # $1: list_dir
 show_build_lists(){
     local list temp
-    for item in $(ls $1/*.list); do
+    local item
+    for item in "$1"/*.list; do
+        [[ -e "$item" ]] || continue
         temp=${item##*/}
         list=${list:-}${list:+|}${temp%.list}
     done
-    echo $list
+    echo "$list"
 }
 
 # $1: make_conf_dir
 show_build_profiles(){
     local cpuarch temp
-    for item in $(ls $1/*.conf); do
+    local item
+    for item in "$1"/*.conf; do
+        [[ -e "$item" ]] || continue
         temp=${item##*/}
         cpuarch=${cpuarch:-}${cpuarch:+|}${temp%.conf}
     done
-    echo $cpuarch
+    echo "$cpuarch"
 }
 
 # $1: list_dir
 # $2: build list
 eval_build_list(){
-    eval "case $2 in
-        $(show_build_lists $1)) is_build_list=true; read_build_list $1/$2 ;;
+    local list_pattern
+    list_pattern=$(show_build_lists "$1")
+    case "$2" in
+        $list_pattern) is_build_list=true; read_build_list "$1/$2" ;;
         *) is_build_list=false ;;
-    esac"
+    esac
 }
 
 in_array() {
     local needle=$1; shift
     local item
     for item in "$@"; do
-        [[ $item = $needle ]] && return 0 # Found
+        [[ $item = "$needle" ]] && return 0 # Found
     done
     return 1 # Not Found
 }
 
 get_timer(){
-    echo $(date +%s)
+    date +%s
 }
-
 
 # $1: start timer
 elapsed_time(){
-    echo $(echo $1 $(get_timer) | awk '{ printf "%0.2f",($2-$1)/60 }')
+    awk -v start="$1" -v now="$(get_timer)" 'BEGIN { printf "%0.2f",(now-start)/60 }'
 }
 
 show_elapsed_time(){
-    info "Time %s: %s minutes" "$1" "$(elapsed_time $2)"
+    info "Time %s: %s minutes" "$1" "$(elapsed_time "$2")"
 }
 
 lock() {
-    eval "exec $1>"'"$2"'
-    if ! flock -n $1; then
-        stat_busy "$3"
-        flock $1
+    local fd="$1" file="$2" msg="$3"
+    eval "exec $fd>\"$file\""
+    if ! flock -n "$fd"; then
+        stat_busy "$msg"
+        flock "$fd"
         stat_done
     fi
 }
 
 slock() {
-    eval "exec $1>"'"$2"'
-    if ! flock -sn $1; then
-        stat_busy "$3"
-        flock -s $1
+    local fd="$1" file="$2" msg="$3"
+    eval "exec $fd>\"$file\""
+    if ! flock -sn "$fd"; then
+        stat_busy "$msg"
+        flock -s "$fd"
         stat_done
     fi
 }
@@ -167,7 +185,6 @@ copy_mirrorlist(){
     if [[ -d /etc/pacman.d/blackarch-mirrorlist ]] && [[ ! -d $1/etc/pacman.d/blackarch-mirrorlist ]]; then
         cp -a /etc/pacman.d/blackarch-mirrorlist "$1/etc/pacman.d/"
     fi
-
 }
 
 copy_keyring(){
@@ -182,21 +199,19 @@ load_vars() {
     [[ -f $1 ]] || return 1
 
     for var in {SRC,SRCPKG,PKG,LOG}DEST MAKEFLAGS PACKAGER CARCH GPGKEY; do
-        [[ -z ${!var} ]] && eval $(grep -a "^${var}=" "$1")
+        [[ -z ${!var} ]] && eval "$(grep -a "^${var}=" "$1")"
     done
 
     return 0
 }
 
 prepare_dir(){
-    if [[ ! -d $1 ]]; then
-        mkdir -p $1
-    fi
+    [[ -d $1 ]] || mkdir -p "$1"
 }
 
 # $1: chroot
 get_branch(){
-    echo $(cat "$1/etc/pacman-mirrors.conf" | grep '^Branch = ' | sed 's/Branch = \s*//g')
+    grep '^Branch = ' "$1/etc/pacman-mirrors.conf" | sed 's/Branch = \s*//g'
 }
 
 # $1: chroot
@@ -204,59 +219,43 @@ get_branch(){
 set_branch(){
     if [[ $1 =~ "rootfs" ]]; then
         info "Setting mirrorlist branch: %s" "$2"
-        sed -e "s|/archlinux|/$2|g" -i "$1/etc/pacman.d/mirrorlist"
+        sed -i "s|/archlinux|/$2|g" "$1/etc/pacman.d/mirrorlist"
     fi
 }
 
 init_common(){
     [[ -z ${target_branch} ]] && target_branch='archlinux'
-
     [[ -z ${target_arch} ]] && target_arch=$(uname -m)
-
     [[ -z ${cache_dir} ]] && cache_dir='/var/cache/garuda-tools/garuda-builds'
-
     [[ -z ${chroots_dir} ]] && chroots_dir='/var/cache/garuda-tools/garuda-chroots'
-
     [[ -z ${log_dir} ]] && log_dir='/var/cache/garuda-tools/garuda-logs'
-
     [[ -z ${build_mirror} ]] && build_mirror='https://builds.garudalinux.org/arch-mirror'
-
     [[ -z ${tmp_dir} ]] && tmp_dir='/tmp/garuda-tools'
 }
 
 init_buildtree(){
     tree_dir=${cache_dir}/pkgtree
-
     tree_dir_abs=${tree_dir}/packages-archlinux
-
     [[ -z ${repo_tree[@]} ]] && repo_tree=('core' 'extra' 'community' 'multilib')
-
     [[ -z ${host_tree} ]] && host_tree='https://gitlab.com/garuda-linux'
-
     [[ -z ${host_tree_abs} ]] && host_tree_abs='https://projects.archlinux.org/git/svntogit'
 }
 
 init_buildpkg(){
     chroots_pkg="${chroots_dir}/buildpkg"
-
     list_dir_pkg="${SYSCONFDIR}/pkg.list.d"
-
     make_conf_dir="${SYSCONFDIR}/make.conf.d"
-
     [[ -d ${USERCONFDIR}/pkg.list.d ]] && list_dir_pkg=${USERCONFDIR}/pkg.list.d
-
     [[ -z ${build_list_pkg} ]] && build_list_pkg='default'
-
     cache_dir_pkg=${cache_dir}/pkg
 }
 
 get_iso_label(){
     local label="$1"
-    #label="${label//_}"	# relace all _
-    label="${label//-}"	# relace all -
-    label="${label^^}"		# all uppercase
-    label="${label::32}"	# limit to 32 characters
-    echo ${label}
+    label="${label//-}"
+    label="${label^^}"
+    label="${label::32}"
+    echo "${label}"
 }
 
 get_codename(){
@@ -296,146 +295,94 @@ get_osid(){
 
 init_buildiso(){
     chroots_iso="${chroots_dir}/buildiso"
-
     list_dir_iso="${SYSCONFDIR}/iso.list.d"
-
     [[ -d ${USERCONFDIR}/iso.list.d ]] && list_dir_iso=${USERCONFDIR}/iso.list.d
-
     [[ -z ${build_list_iso} ]] && build_list_iso='default'
-
     cache_dir_iso="${cache_dir}/iso"
-
     profile_repo='iso-profiles'
 
     ##### iso settings #####
 
     [[ -z ${dist_timestamp} ]] && dist_timestamp="$(date +%y%m%d)"
-
     [[ -z ${dist_release} ]] && dist_release=$(get_release)
-
     [[ -z ${dist_codename} ]] && dist_codename=$(get_codename)
 
     dist_name=$(get_distname)
-
     iso_name=$(get_osid)
 
     [[ -z ${dist_branding} ]] && dist_branding="garuda"
-
     [[ -z ${iso_compression} ]] && iso_compression='xz'
-
     [[ -z ${kernel} ]] && kernel="linux-garuda"
 
     load_run_dir "${profile_repo}"
 
     if [[ -d ${run_dir}/.git ]]; then
-    	current_path=$(pwd)
-    	cd ${run_dir}
-    	branch=$(git rev-parse --abbrev-ref HEAD)
-    	cd ${current_path}
+        current_path=$(pwd)
+        cd "${run_dir}"
+        branch=$(git rev-parse --abbrev-ref HEAD)
+        cd "${current_path}"
     else
-    	[[ -z ${branch} ]] && branch="master" #current branch release
+        [[ -z ${branch} ]] && branch="master"
     fi
 
     [[ -z ${gpgkey} ]] && gpgkey=''
-
     mhwd_repo="/opt/ght/pkg"
 }
 
 init_calamares(){
-
-	[[ -z ${welcomestyle} ]] && welcomestyle=false
-
-	[[ -z ${welcomelogo} ]] && welcomelogo=true
-
-	[[ -z ${windowexp} ]] && windowexp=noexpand
-
-	[[ -z ${windowsize} ]] && windowsize="910px,664px"
-
-	[[ -z ${windowplacement} ]] && windowplacement="center"
-
-	[[ -z ${sidebarbackground} ]] && sidebarbackground=#1e1e2e
-
-	[[ -z ${sidebartext} ]] &&  sidebartext=#cdd6f4
-
-	[[ -z ${sidebartextcurrent} ]] && sidebartextcurrent=#1e1e2e
-
-	[[ -z ${sidebarbackgroundcurrent} ]] && sidebarbackgroundcurrent=#7f03b8
+    [[ -z ${welcomestyle} ]] && welcomestyle=false
+    [[ -z ${welcomelogo} ]] && welcomelogo=true
+    [[ -z ${windowexp} ]] && windowexp=noexpand
+    [[ -z ${windowsize} ]] && windowsize="910px,664px"
+    [[ -z ${windowplacement} ]] && windowplacement="center"
+    [[ -z ${sidebarbackground} ]] && sidebarbackground=#1e1e2e
+    [[ -z ${sidebartext} ]] && sidebartext=#cdd6f4
+    [[ -z ${sidebartextcurrent} ]] && sidebartextcurrent=#1e1e2e
+    [[ -z ${sidebarbackgroundcurrent} ]] && sidebarbackgroundcurrent=#7f03b8
 }
 
-
 init_deployiso(){
-
     host="sourceforge.net"
-
     [[ -z ${account} ]] && account="[SetUser]"
-
     [[ -z ${alt_storage} ]] && alt_storage=false
-
     [[ -z ${tracker_url} ]] && tracker_url='udp://lonewolf-builder.duckdns.org:23069'
-
     [[ -z ${piece_size} ]] && piece_size=21
-
     torrent_meta="$(get_distid)"
 }
 
 load_config(){
-
     [[ -f $1 ]] || return 1
-
     garuda_tools_conf="$1"
-
-    [[ -r ${garuda_tools_conf} ]] && source ${garuda_tools_conf}
-
+    [[ -r ${garuda_tools_conf} ]] && source "${garuda_tools_conf}"
     init_common
-
     init_buildtree
-
     init_buildpkg
-
     init_buildiso
-
     init_calamares
-
     init_deployiso
-
     return 0
 }
 
 load_profile_config(){
-
     [[ -f $1 ]] || return 1
-
     profile_conf="$1"
-
-    [[ -r ${profile_conf} ]] && source ${profile_conf}
+    [[ -r ${profile_conf} ]] && source "${profile_conf}"
 
     [[ -z ${displaymanager} ]] && displaymanager="none"
-
     [[ -z ${autologin} ]] && autologin="true"
     [[ ${displaymanager} == 'none' ]] && autologin="false"
 
     [[ -z ${snap_channel} ]] && snap_channel="stable"
-
     [[ -z ${multilib} ]] && multilib="true"
-
     [[ -z ${plymouth_boot} ]] && plymouth_boot="true"
-
     [[ -z ${nonfree_mhwd} ]] && nonfree_mhwd="true"
-
     [[ -z ${efi_boot_loader} ]] && efi_boot_loader="grub"
-
     [[ -z ${hostname} ]] && hostname="garuda"
-
     [[ -z ${username} ]] && username="garuda"
-
     [[ -z ${use_dracut} ]] && use_dracut="true"
-
     [[ -z ${plymouth_theme} ]] && plymouth_theme="garuda"
-
     [[ -z ${password} ]] && password="garuda"
-
     [[ -z ${user_shell} ]] && user_shell='/bin/bash'
-
     [[ -z ${login_shell} ]] && login_shell='/bin/bash'
 
     if [[ -z ${addgroups} ]]; then
@@ -461,17 +408,13 @@ load_profile_config(){
     [[ -z ${netinstall_label} ]] && netinstall_label='Package selection'
 
     [[ -z ${zfs_used} ]] && zfs_used='false'
-
     [[ -z ${mhwd_used} ]] && mhwd_used='true'
-
     [[ -z ${oem_used} ]] && oem_used='false'
-
     [[ -z ${chrootcfg} ]] && chrootcfg='false'
 
     netgroups="https://gitlab.com/garuda-linux/packages/pkgbuilds/garuda-pkgbuilds/-/raw/master/pkgbuilds/calamares-netinstall-settings/netinstall-software.yaml"
 
     [[ -z ${geoip} ]] && geoip='true'
-
     [[ -z ${smb_workgroup} ]] && smb_workgroup=''
 
     [[ -z ${extra} ]] && extra='true'
@@ -484,10 +427,11 @@ load_profile_config(){
 }
 
 get_edition(){
-    local result=$(find ${run_dir} -maxdepth 2 -name "$1") path
+    local result path
+    result=$(find "${run_dir}" -maxdepth 2 -name "$1")
     [[ -z $result ]] && die "%s is not a valid profile or build list!" "$1"
     path=${result%/*}
-    echo ${path##*/}
+    echo "${path##*/}"
 }
 
 get_project(){
@@ -534,14 +478,12 @@ reset_profile(){
 }
 
 check_profile(){
-    local keyfiles=("$1/Packages-Root"
-            "$1/Packages-Live")
+    local keyfiles=("$1/Packages-Root" "$1/Packages-Live")
+    local keydirs=("$1/root-overlay" "$1/live-overlay")
+    local has_keyfiles=true has_keydirs=true
+    local f d
 
-    local keydirs=("$1/root-overlay"
-            "$1/live-overlay")
-
-    local has_keyfiles=false has_keydirs=false
-    for f in ${keyfiles[@]}; do
+    for f in "${keyfiles[@]}"; do
         if [[ -f $f ]]; then
             has_keyfiles=true
         else
@@ -549,7 +491,7 @@ check_profile(){
             break
         fi
     done
-    for d in ${keydirs[@]}; do
+    for d in "${keydirs[@]}"; do
         if [[ -d $d ]]; then
             has_keydirs=true
         else
@@ -557,13 +499,13 @@ check_profile(){
             break
         fi
     done
+
     if ! ${has_keyfiles} && ! ${has_keydirs}; then
         die "Profile [%s] sanity check failed!" "$1"
     fi
 
     [[ -f "$1/Packages-Desktop" ]] && packages_desktop=$1/Packages-Desktop
     [[ -f "$1/Packages-Desktop-Common" ]] && packages_desktop_common=$1/Packages-Desktop-Common
-
     [[ -f "$1/Packages-Mhwd" ]] && packages_mhwd=$1/Packages-Mhwd
 
     if ! ${netinstall}; then
@@ -600,7 +542,6 @@ load_pkgs(){
             if ${nonfree_mhwd}; then
                 _nonfree_default="s|>nonfree_default||g"
                 _nonfree_i686="s|>nonfree_i686||g"
-
             else
                 _nonfree_default="s|>nonfree_default.*||g"
                 _nonfree_i686="s|>nonfree_i686.*||g"
@@ -636,7 +577,6 @@ load_pkgs(){
         ;;
     esac
 
-# We can reuse this code
     local _edition _edition_rm
     case "${edition}" in
         'sonar')
@@ -658,7 +598,8 @@ load_pkgs(){
         _purge="s|>cleanup.*||g" \
         _purge_rm="s|>cleanup||g"
 
-    local pkgs=$(sed "$_com_rm" "$1" \
+    local pkgs
+    pkgs=$(sed "$_com_rm" "$1" \
             | sed "$_space" \
             | sed "$_blacklist" \
             | sed "$_purge" \
@@ -685,7 +626,6 @@ load_pkgs(){
     fi
 
     if [[ $1 == "${packages_mhwd}" ]]; then
-
         [[ ${_used_kernel} < "42" ]] && local _amd="s|xf86-video-amdgpu||g"
 
         packages_cleanup=$(sed "$_com_rm" "$1" \
@@ -699,25 +639,25 @@ load_pkgs(){
 
 user_own(){
     local flag=$2
-    chown ${flag} "${OWNER}:$(id --group ${OWNER})" "$1"
+    chown "${flag}" "${OWNER}:$(id --group "${OWNER}")" "$1"
 }
 
 clean_dir(){
     if [[ -d $1 ]]; then
         msg "Cleaning [%s] ..." "$1"
-        rm -r $1/*
+        rm -r "${1}"/*
     fi
 }
 
 write_repo_conf(){
-    local repos=$(find $USER_HOME -type f -name "repo_info")
-    local path name
+    local repos path name
     _workdir='/var/cache/garuda-tools'
+    mapfile -t repos < <(find "${USER_HOME}" -type f -name "repo_info")
     [[ -z ${repos[@]} ]] && run_dir=${_workdir}/iso-profiles && return 1
-    for r in ${repos[@]}; do
+    for r in "${repos[@]}"; do
         path=${r%/repo_info}
         name=${path##*/}
-        echo "run_dir=$path" > ${USERCONFDIR}/$name.conf
+        echo "run_dir=$path" > "${USERCONFDIR}/$name.conf"
     done
 }
 
@@ -725,7 +665,7 @@ load_user_info(){
     OWNER=${SUDO_USER:-$USER}
 
     if [[ -n $SUDO_USER ]]; then
-        eval "USER_HOME=~$SUDO_USER"
+        USER_HOME=$(eval echo ~"$SUDO_USER")
     else
         USER_HOME=$HOME
     fi
@@ -736,7 +676,7 @@ load_user_info(){
 
 load_run_dir(){
     [[ -f ${USERCONFDIR}/$1.conf ]] || write_repo_conf
-    [[ -r ${USERCONFDIR}/$1.conf ]] && source ${USERCONFDIR}/$1.conf
+    [[ -r ${USERCONFDIR}/$1.conf ]] && source "${USERCONFDIR}/$1.conf"
     return 0
 }
 
@@ -755,39 +695,34 @@ show_config(){
 
 # $1: chroot
 kill_chroot_process(){
-    # enable to have more debug info
-    #msg "machine-id (etc): $(cat $1/etc/machine-id)"
-    #[[ -e $1/var/lib/dbus/machine-id ]] && msg "machine-id (lib): $(cat $1/var/lib/dbus/machine-id)"
-    #msg "running processes: "
-    #lsof | grep $1
-
     local prefix="$1" flink pid name
+    local root_dir
     for root_dir in /proc/*/root; do
-        flink=$(readlink $root_dir)
-        if [ "x$flink" != "x" ]; then
-            if [ "x${flink:0:${#prefix}}" = "x$prefix" ]; then
-                # this process is in the chroot...
-                pid=$(basename $(dirname "$root_dir"))
-                name=$(ps -p $pid -o comm=)
-                info "Killing chroot process: %s (%s)" "$name" "$pid"
-                kill -9 "$pid"
-            fi
+        [[ -e "$root_dir" ]] || continue
+        flink=$(readlink "$root_dir")
+        if [[ -n "$flink" ]] && [[ "${flink:0:${#prefix}}" = "$prefix" ]]; then
+            pid=$(basename "$(dirname "$root_dir")")
+            name=$(ps -p "$pid" -o comm= 2>/dev/null)
+            info "Killing chroot process: %s (%s)" "$name" "$pid"
+            kill -9 "$pid"
         fi
     done
 }
 
 create_min_fs(){
     msg "Creating install root at %s" "$1"
-    mkdir -m 0755 -p $1/var/{cache/pacman/pkg,lib/pacman,log} $1/{dev,run,etc}
-    mkdir -m 1777 -p $1/tmp
-    mkdir -m 0555 -p $1/{sys,proc}
+    mkdir -m 0755 -p "$1/var/{cache/pacman/pkg,lib/pacman,log}" "$1/{dev,run,etc}"
+    mkdir -m 1777 -p "$1/tmp"
+    mkdir -m 0555 -p "$1/{sys,proc}"
 }
 
 is_valid_arch_pkg(){
-    eval "case $1 in
-        $(show_build_profiles "${make_conf_dir}")) return 0 ;;
+    local profiles
+    profiles=$(show_build_profiles "${make_conf_dir}")
+    case "$1" in
+        $profiles) return 0 ;;
         *) return 1 ;;
-    esac"
+    esac
 }
 
 is_valid_arch_iso(){
@@ -813,11 +748,12 @@ is_valid_comp(){
 
 run(){
     if ${is_build_list}; then
-        for item in ${build_list[@]}; do
-            $1 $item
+        local item
+        for item in "${build_list[@]}"; do
+            "$1" "$item"
         done
     else
-        $1 $2
+        "$1" "$2"
     fi
 }
 
@@ -827,10 +763,9 @@ is_btrfs() {
 
 subvolume_delete_recursive() {
     local subvol
-
     is_btrfs "$1" || return 0
 
-    while IFS= read -d $'\0' -r subvol; do
+    while IFS= read -r -d '' subvol; do
         if ! btrfs subvolume delete "$subvol" &>/dev/null; then
             error "Unable to delete subvolume %s" "$subvol"
             return 1
@@ -841,29 +776,27 @@ subvolume_delete_recursive() {
 }
 
 create_chksums() {
-    msg2 "creating checksums for [$1]"
-    sha1sum $1 > $1.sha1
-    sha256sum $1 > $1.sha256
+    msg2 "creating checksums for [%s]" "$1"
+    sha1sum "$1" > "$1.sha1"
+    sha256sum "$1" > "$1.sha256"
 }
 
 init_profiles() {
-	_workdir='/var/cache/garuda-tools'
-	if [[ -d ${_workdir}/iso-profiles ]]; then
-		rm -Rf ${_workdir}/iso-profiles
-	fi
-	git clone -q --depth 1 -b ${branch} https://gitlab.com/garuda-linux/tools/iso-profiles.git ${_workdir}/iso-profiles/
+    _workdir='/var/cache/garuda-tools'
+    if [[ -d ${_workdir}/iso-profiles ]]; then
+        rm -Rf "${_workdir}/iso-profiles"
+    fi
+    git clone -q --depth 1 -b "${branch}" https://gitlab.com/garuda-linux/tools/iso-profiles.git "${_workdir}/iso-profiles/"
 
-	#Check if git clone is done
-	if [[ -d ${_workdir}/iso-profiles/garuda ]] || [[ -d ${_workdir}/iso-profiles/community ]]; then
-
-		for i in ${_workdir}/iso-profiles/.gitignore ${_workdir}/iso-profiles/README.md; do
-		rm -f $i
-		done
-
-		for i in ${_workdir}/iso-profiles/.git ${_workdir}/iso-profiles/sonar; do
-			rm -Rf $i
-		done
-	else msg2 "Impossible to initialize iso-profiles, please check internet connection or browse at 'https://gitlab.com/garuda-linux/tools/iso-profiles'"
-	exit 1
-	fi
+    if [[ -d ${_workdir}/iso-profiles/garuda ]] || [[ -d ${_workdir}/iso-profiles/community ]]; then
+        for i in "${_workdir}/iso-profiles/.gitignore" "${_workdir}/iso-profiles/README.md"; do
+            rm -f "$i"
+        done
+        for i in "${_workdir}/iso-profiles/.git" "${_workdir}/iso-profiles/sonar"; do
+            rm -Rf "$i"
+        done
+    else
+        msg2 "Impossible to initialize iso-profiles, please check internet connection or browse at 'https://gitlab.com/garuda-linux/tools/iso-profiles'"
+        exit 1
+    fi
 }
